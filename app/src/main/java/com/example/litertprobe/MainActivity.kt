@@ -5,7 +5,6 @@ import android.os.Bundle
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.nnapi.NnapiDelegate
 import java.io.File
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -22,7 +21,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         logView = findViewById(R.id.logText)
 
-        // Фоновый поток средствами Java/Kotlin stdlib (без сторонних библиотек)
         Thread {
             runDiagnostics()
         }.start()
@@ -41,7 +39,7 @@ class MainActivity : AppCompatActivity() {
         log("Android   : ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
         log("------------------------------------\n")
 
-        // 1. Проверка видимости системных узлов Samsung NPU
+        // 1. Проверка системных драйверов ядра
         log("[*] Проверка системных файлов ядра:")
         val vertexNode = File("/dev/vertex10")
         log("  /dev/vertex10 : ${if (vertexNode.exists()) "ВИДЕН" else "Не виден напрямую (SELinux)"}")
@@ -49,28 +47,21 @@ class MainActivity : AppCompatActivity() {
         val ennLib = File("/vendor/lib64/libenn_engine_lib.so")
         log("  libenn_engine : ${if (ennLib.exists()) "ПРИСУТСТВУЕТ" else "Не найден"}")
 
-        // 2. Запуск инференса на NPU через LiteRT
+        // 2. Инициализация через встроенный NNAPI флаг
         log("\n[*] Инициализация инференса через NPU (NNAPI):")
-        var nnapiDelegate: NnapiDelegate? = null
         var interpreter: Interpreter? = null
 
         try {
             val modelBuffer = loadModelFile("model.tflite")
             log("  [+] Модель INT8 загружена из assets")
 
-            val nnapiOptions = NnapiDelegate.Options().apply {
-                setExecutionPreference(NnapiDelegate.Options.EXECUTION_PREFERENCE_FAST_SINGLE_ANSWER)
-                setAllowFp16(true)
-            }
-            nnapiDelegate = NnapiDelegate(nnapiOptions)
-
             val options = Interpreter.Options().apply {
-                addDelegate(nnapiDelegate)
+                setUseNNAPI(true)
                 setNumThreads(4)
             }
 
             interpreter = Interpreter(modelBuffer, options)
-            log("  [+] Драйвер NPU успешно подхвачен LiteRT!")
+            log("  [+] LiteRT успешно подключил системный NPU/NNAPI драйвер!")
 
             // Буферы для MobileNet: 1x224x224x3 INT8
             val inputSize = 1 * 224 * 224 * 3
@@ -105,7 +96,6 @@ class MainActivity : AppCompatActivity() {
             log("  (Система выполнила откат на CPU)")
         } finally {
             interpreter?.close()
-            nnapiDelegate?.close()
         }
     }
 
