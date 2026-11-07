@@ -3,22 +3,45 @@ package com.example.litertprobe
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import com.google.ai.edge.litert.Accelerator
-import com.google.ai.edge.litert.CompiledModel
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.File
+import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.sqrt
 
-class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
+class FullTrackProcessor(modelFile: File, val useGpu: Boolean) {
 
-    private val chunkSize = 240_000
+    private val chunkSize = 240_000 // 10 сек * 24000 Гц
     private val targetSampleRate = 24_000
     private val embeddingDim = 1024
 
-    private val compiledModel: CompiledModel = CompiledModel.create(
-        modelFile.absolutePath,
-        CompiledModel.Options(accelerator)
-    )
+    private var gpuDelegate: GpuDelegate? = null
+    private val interpreter: Interpreter
+
+    // Выделяем direct-буферы один раз для отправки данных без оверхеда JVM
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(chunkSize * 4).apply {
+        order(ByteOrder.nativeOrder())
+    }
+    private val outputBuffer: ByteBuffer = ByteBuffer.allocateDirect(embeddingDim * 4).apply {
+        order(ByteOrder.nativeOrder())
+    }
+
+    init {
+        val options = Interpreter.Options().apply {
+            if (useGpu) {
+                val compatList = CompatibilityList()
+                val delegateOptions = compatList.bestOptionsForThisDevice
+                val delegate = GpuDelegate(delegateOptions)
+                gpuDelegate = delegate
+                addDelegate(delegate)
+            } else {
+                setNumThreads(4)
+            }
+        }
+        interpreter = Interpreter(modelFile, options)
+    }
 
     data class TrackResult(
         val embedding: FloatArray,
@@ -81,14 +104,17 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
     }
 
     private fun runInference(inputData: FloatArray): FloatArray {
-        val inputs = compiledModel.createInputBuffers()
-        val outputs = compiledModel.createOutputBuffers()
+        inputBuffer.rewind()
+        val floatIn = inputBuffer.asFloatBuffer()
+        floatIn.put(inputData)
 
-        inputs[0].writeFloat(inputData)
-        compiledModel.run(inputs, outputs)
+        outputBuffer.rewind()
 
+        interpreter.run(inputBuffer, outputBuffer)
+
+        outputBuffer.rewind()
         val result = FloatArray(embeddingDim)
-        outputs[0].readFloat(result)
+        outputBuffer.asFloatBuffer().get(result)
         return result
     }
 
@@ -128,9 +154,9 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
         }
 
         extractor.selectTrack(audioTrackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)!!
-        val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-        val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+        val sampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
+        val channelCount = if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
 
         val codec = MediaCodec.createDecoderByType(mime)
         codec.configure(format, null, null, 0)
@@ -195,7 +221,8 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
     }
 
     fun close() {
-        compiledModel.close()
+        interpreter.close()
+        gpuDelegate?.close()
     }
 }
 

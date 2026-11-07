@@ -10,7 +10,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import com.google.ai.edge.litert.Accelerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -22,7 +21,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private val logBuilder = StringBuilder()
 
-    // Количество треков для бенчмарка
     private val testTrackCount = 3
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,12 +110,12 @@ class MainActivity : AppCompatActivity() {
         // ==========================================
         // 1. ТЕСТ НА CPU
         // ==========================================
-        log("[*] 1. Инициализация FullTrackProcessor на CPU...")
+        log("[*] 1. Инициализация на CPU...")
         var cpuTotalInfMs = 0L
         var cpuTotalChunks = 0
 
         try {
-            val cpuProcessor = FullTrackProcessor(modelFile, Accelerator.CPU)
+            val cpuProcessor = FullTrackProcessor(modelFile, useGpu = false)
             log("  [+] Модель загружена на CPU")
 
             for ((i, file) in audioFiles.withIndex()) {
@@ -136,12 +134,12 @@ class MainActivity : AppCompatActivity() {
         // ==========================================
         // 2. ТЕСТ НА GPU (AMD Xclipse)
         // ==========================================
-        log("\n[*] 2. Инициализация FullTrackProcessor на GPU...")
+        log("\n[*] 2. Инициализация на GPU...")
         var gpuTotalInfMs = 0L
         var gpuTotalChunks = 0
 
         try {
-            val gpuProcessor = FullTrackProcessor(modelFile, Accelerator.GPU)
+            val gpuProcessor = FullTrackProcessor(modelFile, useGpu = true)
             log("  [+] Шейдеры скомпилированы на GPU")
 
             for ((i, file) in audioFiles.withIndex()) {
@@ -168,7 +166,7 @@ class MainActivity : AppCompatActivity() {
                 log(" GPU среднее на чанк : %.0f ms".format(gpuAvgChunkMs))
                 log(" Разница             : %.2fx ускорение".format(speedup))
                 log("------------------------------------")
-                val track3MinChunks = 35 // 3 минуты с шагом 5 сек = 35 окон
+                val track3MinChunks = 35
                 val est3MinCpuSec = (cpuAvgChunkMs * track3MinChunks) / 1000.0
                 val est3MinGpuSec = (gpuAvgChunkMs * track3MinChunks) / 1000.0
                 log(" РАСЧЕТ НА ТРЕК 3 МИНУТЫ:")
