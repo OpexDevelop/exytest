@@ -17,6 +17,7 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.Message
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
@@ -105,7 +106,6 @@ class MainActivity : AppCompatActivity() {
         val defaultFile = File(downloadDir, "gemma-4-E2B-it_NPU_Uncompiled.litertlm")
         if (defaultFile.exists() && defaultFile.isFile) return defaultFile
 
-        // Поиск любого другого .litertlm файла в папке Загрузки
         val files = downloadDir.listFiles { _, name -> name.endsWith(".litertlm") }
         if (!files.isNullOrEmpty()) return files[0]
 
@@ -132,7 +132,6 @@ class MainActivity : AppCompatActivity() {
         val startTime = System.currentTimeMillis()
 
         try {
-            // Подключение нативного NPU бэкенда LiteRT-LM
             val config = EngineConfig(
                 modelPath = modelFile.absolutePath,
                 backend = Backend.NPU(nativeLibraryDir = applicationInfo.nativeLibraryDir),
@@ -151,7 +150,6 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread { btnSend.isEnabled = true }
 
-            // Стартовый проверочный запрос
             sendUserMessage("Say hello and confirm you are running on NPU in one short sentence.")
 
         } catch (e: Throwable) {
@@ -191,10 +189,10 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(lmDispatcher) {
             val start = System.currentTimeMillis()
             conv.sendMessageAsync(prompt)
-                .catch { err ->
+                .catch { err: Throwable ->
                     log("\n[-] Ошибка инференса: ${err.message}")
                 }
-                .collect { chunk ->
+                .collect { chunk: Message ->
                     appendStream(chunk.toString())
                 }
 
@@ -207,8 +205,12 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         lmExecutor.execute {
-            conversation?.close()
-            engine?.close()
+            try {
+                conversation?.close()
+                engine?.close()
+            } catch (e: Exception) {
+                // игнорируем ошибки закрытия
+            }
         }
     }
 }
