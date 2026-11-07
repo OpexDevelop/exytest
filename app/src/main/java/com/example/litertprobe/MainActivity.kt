@@ -5,7 +5,8 @@ import android.os.Bundle
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import com.google.ai.edge.litert.*
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
 
 class MainActivity : AppCompatActivity() {
 
@@ -20,7 +21,7 @@ class MainActivity : AppCompatActivity() {
         scrollView = findViewById(R.id.scrollView)
 
         Thread {
-            runStrictCompiledModelAudit()
+            runCompiledModelAudit()
         }.start()
     }
 
@@ -32,8 +33,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runStrictCompiledModelAudit() {
-        log("=== LITERТ SAMSUNG NPU AUDIT ===")
+    private fun runCompiledModelAudit() {
+        log("=== LITERТ COMPILED MODEL AUDIT ===")
         log("SoC     : ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
         log("Система : Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
 
@@ -42,34 +43,14 @@ class MainActivity : AppCompatActivity() {
         val inputData = FloatArray(inputSize) { 0.5f }
         val iterations = 10
 
-        // 1. Аппаратная проверка совместимости через Samsung SDK
-        try {
-            val isSupported = NpuCompatibilityChecker.Samsung.isDeviceSupported()
-            log("[*] NpuCompatibilityChecker.Samsung: $isSupported")
-        } catch (e: Throwable) {
-            log("[!] Чекер совместимости недоступен: ${e.message}")
-        }
-
-        // 2. Инициализация Environment с NPU провайдером
-        val env: Environment
-        try {
-            log("[*] Создание Environment(BuiltinNpuAcceleratorProvider)...")
-            env = Environment.create(BuiltinNpuAcceleratorProvider(this))
-            log("[+] Environment инициализирован с системными NPU драйверами")
-        } catch (e: Throwable) {
-            log("[-] Ошибка создания Environment: ${e.message}")
-            return
-        }
-
-        // 3. Тест эталона: чистый CPU
-        log("\n[*] 1. Запуск на CPU (через CompiledModel + env)...")
+        // 1. Тест на CPU
+        log("[*] 1. Запуск CompiledModel(Accelerator.CPU)...")
         var cpuAvgMs = 0.0
         try {
             val cpuModel = CompiledModel.create(
                 assets,
                 modelAsset,
-                CompiledModel.Options(Accelerator.CPU),
-                env
+                CompiledModel.Options(Accelerator.CPU)
             )
             val cpuInputs = cpuModel.createInputBuffers()
             val cpuOutputs = cpuModel.createOutputBuffers()
@@ -88,18 +69,43 @@ class MainActivity : AppCompatActivity() {
             log("[-] Ошибка на CPU: ${e.message}")
         }
 
-        // 4. Тест аппаратного NPU
-        log("\n[*] 2. Запуск на NPU (Samsung Exynos LiteCore + env)...")
+        // 2. Тест на GPU (для аппаратного ориентира графики AMD Xclipse)
+        log("\n[*] 2. Запуск CompiledModel(Accelerator.GPU)...")
+        var gpuAvgMs = 0.0
+        try {
+            val gpuModel = CompiledModel.create(
+                assets,
+                modelAsset,
+                CompiledModel.Options(Accelerator.GPU)
+            )
+            val gpuInputs = gpuModel.createInputBuffers()
+            val gpuOutputs = gpuModel.createOutputBuffers()
+            gpuInputs[0].writeFloat(inputData)
+            gpuModel.run(gpuInputs, gpuOutputs)
+
+            val start = System.nanoTime()
+            for (i in 0 until iterations) {
+                gpuInputs[0].writeFloat(inputData)
+                gpuModel.run(gpuInputs, gpuOutputs)
+            }
+            gpuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
+            log("  -> Время на GPU: %.2f ms".format(gpuAvgMs))
+            gpuModel.close()
+        } catch (e: Throwable) {
+            log("[-] Ошибка на GPU: ${e.message}")
+        }
+
+        // 3. Тест на NPU
+        log("\n[*] 3. Запуск CompiledModel(Accelerator.NPU)...")
         try {
             val npuInitStart = System.currentTimeMillis()
             val npuModel = CompiledModel.create(
                 assets,
                 modelAsset,
-                CompiledModel.Options(Accelerator.NPU),
-                env
+                CompiledModel.Options(Accelerator.NPU)
             )
             val npuInitMs = System.currentTimeMillis() - npuInitStart
-            log("  [✓] On-device компиляция графа NPU завершена за ${npuInitMs} ms")
+            log("  [+] Время создания NPU-модели: ${npuInitMs} ms")
 
             val npuInputs = npuModel.createInputBuffers()
             val npuOutputs = npuModel.createOutputBuffers()
@@ -114,23 +120,17 @@ class MainActivity : AppCompatActivity() {
             val npuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
             log("  -> Время на NPU: %.2f ms".format(npuAvgMs))
 
-            val speedup = if (cpuAvgMs > 0) cpuAvgMs / npuAvgMs else 0.0
             log("\n====================================")
-            log(" ИТОГОВЫЙ СТАТУС:")
-            log(" CPU время : %.2f ms".format(cpuAvgMs))
-            log(" NPU время : %.2f ms".format(npuAvgMs))
-            log(" Разница   : %.1fx ускорение".format(speedup))
-            if (speedup >= 1.5) {
-                log(" ВЕРДИКТ   : АППАРАТНЫЙ NPU EXYNOS РЕАЛЬНО ЗАДЕЙСТВОВАН!")
-            } else {
-                log(" ВЕРДИКТ   : Ускорения нет (проверьте логи JIT-компилятора)")
-            }
+            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ:")
+            log(" CPU : %.2f ms".format(cpuAvgMs))
+            log(" GPU : %.2f ms".format(gpuAvgMs))
+            log(" NPU : %.2f ms".format(npuAvgMs))
             log("====================================")
 
             npuModel.close()
         } catch (e: Throwable) {
-            log("\n[-] Ошибка выполнения на NPU: ${e.javaClass.simpleName}")
-            log("    Детали: ${e.message}")
+            log("\n[-] Ошибка инициализации NPU:")
+            log("    ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 }

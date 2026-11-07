@@ -48,9 +48,8 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
 
-    // LiteRT ядро и нативный рантайм Samsung NPU Exynos LiteCore
+    // Базовый LiteRT рантайм
     implementation 'com.google.ai.edge.litert:litert:2.3.0'
     implementation 'com.google.ai.edge.litert:litert-gpu:2.3.0'
-    implementation 'com.google.ai.edge.litert:litert-npu-runtime-samsung:2.3.0'
 }
 
