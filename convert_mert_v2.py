@@ -39,59 +39,44 @@ sys.modules["torchaudio"] = mod_ta
 sys.modules["torchaudio.transforms"] = mod_tat
 
 # =====================================================================
-# 2. ЗАГРУЗКА В FP16 C ОГРАНИЧЕНИЕМ ПАМЯТИ
+# 2. ЭКСПОРТ MERT-v2-FullSong
 # =====================================================================
 from transformers import AutoModel
 import litert_torch as litert
 
-print("[1/3] Загрузка весов MERT-v2-FullSong (FP16, low_cpu_mem_usage)...")
+print("[1/3] Загрузка весов MERT-v2-FullSong (low_cpu_mem_usage)...")
 raw_mert = AutoModel.from_pretrained(
     "m-a-p/MERT-v2-FullSong",
     trust_remote_code=True,
-    torch_dtype=torch.float32,     # Для экспорта графа нужен float32
-    low_cpu_mem_usage=True        # Загрузка без дублирования буферов в RAM
+    torch_dtype=torch.float32,
+    low_cpu_mem_usage=True
 ).eval()
 
-print("[2/3] Подготовка трансформера к экспорту...")
-print("Доступные модули в модели:", [name for name, _ in raw_mert.named_children()])
-
-class MERTBackboneWrapper(nn.Module):
-    def __init__(self, base_model):
+class MERTFullSongExporter(nn.Module):
+    def __init__(self, model):
         super().__init__()
-        # Если есть вложенный трансформер (encoder/model) — берем его, иначе саму модель
-        if hasattr(base_model, "encoder"):
-            self.backbone = base_model.encoder
-        elif hasattr(base_model, "model"):
-            self.backbone = base_model.model
-        else:
-            self.backbone = base_model
+        self.mert = model
 
-    def forward(self, hidden_states):
-        # hidden_states: [1, seq_len, 1024]
-        out = self.backbone(hidden_states)
+    def forward(self, input_values):
+        # input_values: [1, samples] (сырая волна 24 кГц)
+        out = self.mert(input_values=input_values, output_hidden_states=False)
+        frames = out.last_hidden_state  # [1, frames, 1024]
         
-        # Обработка разных типов возвращаемых объектов (tuple или BaseModelOutput)
-        if hasattr(out, "last_hidden_state"):
-            feats = out.last_hidden_state
-        elif isinstance(out, tuple):
-            feats = out[0]
-        else:
-            feats = out
-
-        # Усреднение по временным токенам -> единый вектор трека [1, 1024]
-        pooled = torch.mean(feats, dim=1)
+        # Получаем единый вектор трека через усреднение по времени
+        pooled = torch.mean(frames, dim=1)
         return F.normalize(pooled, p=2, dim=-1)
 
-model_to_export = MERTBackboneWrapper(raw_mert).eval()
+model_to_export = MERTFullSongExporter(raw_mert).eval()
 
-# 3 минуты трека = 180 сек * 25 Hz = 4 500 токенов
-SEQ_LEN = 180 * 25
-sample_input = (torch.zeros(1, SEQ_LEN, 1024, dtype=torch.float32),)
+# 180 секунд (3 минуты) при 24 кГц = 4 320 000 сэмплов
+FULL_SONG_SAMPLES = 180 * 24000
+sample_waveform = (torch.zeros(1, FULL_SONG_SAMPLES, dtype=torch.float32),)
 
-print(f"[3/3] Конвертация LiteRT (последовательность {SEQ_LEN} токенов, FP32)...")
-edge_model = litert.convert(model_to_export, sample_input)
+print(f"[2/3] Конвертация графа (180 сек = {FULL_SONG_SAMPLES} сэмплов) в LiteRT...")
+edge_model = litert.convert(model_to_export, sample_waveform)
 
-output_filename = "mert_v2_backbone.tflite"
+output_filename = "mert_v2_fullsong.tflite"
+print(f"[3/3] Экспорт {output_filename}...")
 edge_model.export(output_filename)
 print(f"[✓] УСПЕШНО! Модель создана: {output_filename}")
 
