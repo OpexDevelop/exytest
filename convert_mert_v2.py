@@ -2,24 +2,18 @@ import sys
 import types
 import importlib.machinery
 
-# Полноценная заглушка со спецификацией модуля для Python 3.11+ и transformers
-def register_dummy_module(name):
-    mod = types.ModuleType(name)
-    mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
-    mod.__version__ = "2.6.0"
-    mod.__path__ = []
-    sys.modules[name] = mod
-    return mod
-
-ta = register_dummy_module("torchaudio")
-ta.functional = register_dummy_module("torchaudio.functional")
-ta.transforms = register_dummy_module("torchaudio.transforms")
-ta.compliance = register_dummy_module("torchaudio.compliance")
-ta.compliance.kaldi = register_dummy_module("torchaudio.compliance.kaldi")
+# Отключаем только C++ расширение torchaudio._extension, несовместимое с ABI torch 2.14.
+# Сами математические слои (Spectrogram, MelScale, AmplitudeToDB) работают на чистом torch!
+ext_mod = types.ModuleType("torchaudio._extension")
+ext_mod.__spec__ = importlib.machinery.ModuleSpec("torchaudio._extension", loader=None)
+ext_mod._IS_TORCHAUDIO_EXT_AVAILABLE = False
+ext_mod._IS_ALIGN_AVAILABLE = False
+sys.modules["torchaudio._extension"] = ext_mod
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms  # Теперь загружаются настоящие классы!
 from transformers import AutoModel
 import litert_torch as litert
 
