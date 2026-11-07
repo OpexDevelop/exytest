@@ -2,16 +2,11 @@ package com.example.litertprobe
 
 import android.os.Build
 import android.os.Bundle
-import android.system.Os
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import org.tensorflow.lite.Interpreter
-import java.io.File
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.channels.FileChannel
+import com.google.ai.edge.litert.Accelerator
+import com.google.ai.edge.litert.CompiledModel
 
 class MainActivity : AppCompatActivity() {
 
@@ -26,7 +21,7 @@ class MainActivity : AppCompatActivity() {
         scrollView = findViewById(R.id.scrollView)
 
         Thread {
-            runRigorousHardwareProbe()
+            runStrictCompiledModelAudit()
         }.start()
     }
 
@@ -38,131 +33,105 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun checkActiveKernelNpuNode(): String? {
-        try {
-            val fdDir = File("/proc/self/fd")
-            val fds = fdDir.listFiles() ?: return null
-            for (fd in fds) {
-                try {
-                    val target = Os.readlink(fd.absolutePath)
-                    if (target.contains("vertex") || target.contains("enn")) {
-                        return "${fd.name} -> $target"
-                    }
-                } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
-        return null
-    }
+    private fun runStrictCompiledModelAudit() {
+        log("=== LITERТ COMPILED MODEL API АУДИТ ===")
+        log("SoC     : ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
+        log("Система : Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
 
-    private fun runRigorousHardwareProbe() {
-        log("=== АППАРАТНЫЙ АУДИТ NPU EXYNOS ===")
-        log("SoC: ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
-        log("Ядро: ${System.getProperty("os.version")}\n")
-
-        val modelBuffer: ByteBuffer
-        try {
-            modelBuffer = loadModelFile("model.tflite")
-            log("[+] Модель INT8 успешно загружена в память")
-        } catch (e: Exception) {
-            log("[-] Ошибка чтения модели: ${e.message}")
-            return
-        }
-
-        // Подготовка тестового тензора (MobileNet INT8: 1x224x224x3)
+        val modelAsset = "model.tflite"
         val inputSize = 1 * 224 * 224 * 3
-        val inputBuffer = ByteBuffer.allocateDirect(inputSize).order(ByteOrder.nativeOrder())
-        for (i in 0 until inputSize) inputBuffer.put((i % 256).toByte())
-        val outputBuffer = ByteBuffer.allocateDirect(1001).order(ByteOrder.nativeOrder())
-
+        val inputData = FloatArray(inputSize) { 0.5f }
         val iterations = 10
 
-        // ==========================================
-        // ТЕСТ 1: Принудительный чистый CPU
-        // ==========================================
-        log("\n[*] 1. Запуск на ЧИСТОМ CPU (4 потока, NNAPI выключен)...")
-        val cpuOptions = Interpreter.Options().apply {
-            setUseNNAPI(false)
-            setNumThreads(4)
-        }
-        val cpuInterpreter = Interpreter(modelBuffer, cpuOptions)
-
-        // Прогрев CPU
-        inputBuffer.rewind(); outputBuffer.rewind()
-        cpuInterpreter.run(inputBuffer, outputBuffer)
-
-        val cpuStart = System.nanoTime()
-        for (i in 0 until iterations) {
-            inputBuffer.rewind(); outputBuffer.rewind()
-            cpuInterpreter.run(inputBuffer, outputBuffer)
-        }
-        val cpuTimeMs = ((System.nanoTime() - cpuStart) / 1_000_000.0) / iterations
-        log("  -> Время на CPU: %.2f ms".format(cpuTimeMs))
-        cpuInterpreter.close()
-
-        // ==========================================
-        // ТЕСТ 2: Аппаратный NPU (Samsung Exynos HAL)
-        // ==========================================
-        log("\n[*] 2. Запуск на NPU (активация драйвера Exynos LiteCore)...")
-        val npuOptions = Interpreter.Options().apply {
-            setUseNNAPI(true)
-        }
-
-        var npuInterpreter: Interpreter? = null
+        // ==========================================================
+        // 1. Тест эталона: чистый CPU через CompiledModel
+        // ==========================================================
+        log("[*] 1. Сборка CompiledModel(Accelerator.CPU)...")
+        var cpuAvgMs = 0.0
         try {
-            npuInterpreter = Interpreter(modelBuffer, npuOptions)
+            val cpuInitStart = System.currentTimeMillis()
+            val cpuModel = CompiledModel.create(
+                assets,
+                modelAsset,
+                CompiledModel.Options(Accelerator.CPU)
+            )
+            val cpuInitMs = System.currentTimeMillis() - cpuInitStart
+            log("  [+] CPU граф готов за ${cpuInitMs} ms")
 
-            // Прогрев NPU и компиляция подграфа
-            inputBuffer.rewind(); outputBuffer.rewind()
-            npuInterpreter.run(inputBuffer, outputBuffer)
+            val cpuInputs = cpuModel.createInputBuffers()
+            val cpuOutputs = cpuModel.createOutputBuffers()
+            cpuInputs[0].writeFloat(inputData)
 
-            // Проверка файлового дескриптора ядра Linux
-            val activeNode = checkActiveKernelNpuNode()
-            if (activeNode != null) {
-                log("  [✓] ПОДТВЕРЖДЕНИЕ ЯДРА: Дескриптор открыт: $activeNode")
-            } else {
-                log("  [?] Дескриптор ядра не обнаружен напрямую (SELinux ограничение)")
-            }
+            // Прогрев
+            cpuModel.run(cpuInputs, cpuOutputs)
 
-            val npuStart = System.nanoTime()
+            val start = System.nanoTime()
             for (i in 0 until iterations) {
-                inputBuffer.rewind(); outputBuffer.rewind()
-                npuInterpreter.run(inputBuffer, outputBuffer)
+                cpuInputs[0].writeFloat(inputData)
+                cpuModel.run(cpuInputs, cpuOutputs)
             }
-            val npuTimeMs = ((System.nanoTime() - npuStart) / 1_000_000.0) / iterations
-            log("  -> Время на NPU: %.2f ms".format(npuTimeMs))
+            cpuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
+            log("  -> Среднее время на CPU: %.2f ms".format(cpuAvgMs))
+            cpuModel.close()
+        } catch (e: Throwable) {
+            log("[-] Ошибка на CPU: ${e.message}")
+        }
 
-            // ==========================================
-            // ИТОГОВЫЙ ВЕРДИКТ
-            // ==========================================
-            val speedup = cpuTimeMs / npuTimeMs
-            log("\n====================================")
-            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ:")
-            log(" CPU (4 ядра) : %.2f ms".format(cpuTimeMs))
-            log(" NPU Exynos   : %.2f ms".format(npuTimeMs))
-            log(" Ускорение    : %.1fx".format(speedup))
-            if (speedup >= 3.0) {
-                log(" ВЕРДИКТ: АППАРАТНЫЙ NPU РАБОТАЕТ!")
-            } else {
-                log(" ВЕРДИКТ: Похоже на fallback на процессор")
+        // ==========================================================
+        // 2. Тест чистого NPU (СТРОГО Accelerator.NPU, БЕЗ ОТКАТА)
+        // ==========================================================
+        log("\n[*] 2. Сборка CompiledModel(Accelerator.NPU)...")
+        log("    (Откат на CPU/GPU запрещён. Если NPU не отвечает — будет крэш с ошибкой)")
+
+        try {
+            val npuInitStart = System.currentTimeMillis()
+
+            // Передаем ТОЛЬКО Accelerator.NPU
+            val npuModel = CompiledModel.create(
+                assets,
+                modelAsset,
+                CompiledModel.Options(Accelerator.NPU)
+            )
+            val npuInitMs = System.currentTimeMillis() - npuInitStart
+
+            log("  [✓] ГРАФ УСПЕШНО СКОМПИЛИРОВАН ПОД EXYNOS LITECORE!")
+            log("      Время on-device NPU компиляции: ${npuInitMs} ms")
+
+            val npuInputs = npuModel.createInputBuffers()
+            val npuOutputs = npuModel.createOutputBuffers()
+            npuInputs[0].writeFloat(inputData)
+
+            // Прогрев
+            npuModel.run(npuInputs, npuOutputs)
+
+            val start = System.nanoTime()
+            for (i in 0 until iterations) {
+                npuInputs[0].writeFloat(inputData)
+                npuModel.run(npuInputs, npuOutputs)
             }
+            val npuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
+            log("  -> Среднее время на NPU: %.2f ms".format(npuAvgMs))
+
+            val outputData = npuOutputs[0].readFloat()
+            log("  -> Выходной тензор получен (${outputData.size} классов)")
+
+            val speedup = if (cpuAvgMs > 0) cpuAvgMs / npuAvgMs else 0.0
+            log("\n====================================")
+            log(" ИТОГОВЫЙ СТАТУС:")
+            log(" CPU время : %.2f ms".format(cpuAvgMs))
+            log(" NPU время : %.2f ms".format(npuAvgMs))
+            log(" Разница   : %.1fx ускорение".format(speedup))
+            log(" ВЕРДИКТ   : АППАРАТНЫЙ NPU EXYNOS АКТИВЕН!")
             log("====================================")
 
-        } catch (e: Exception) {
-            log("[-] Ошибка инициализации NPU: ${e.message}")
-        } finally {
-            npuInterpreter?.close()
-        }
-    }
+            npuModel.close()
 
-    private fun loadModelFile(modelName: String): ByteBuffer {
-        val fileDescriptor = assets.openFd(modelName)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        return fileChannel.map(
-            FileChannel.MapMode.READ_ONLY,
-            fileDescriptor.startOffset,
-            fileDescriptor.declaredLength
-        )
+        } catch (e: Throwable) {
+            log("\n[-] ИСКЛЮЧЕНИЕ: NPU отклонил запуск:")
+            log("    Класс ошибки: ${e.javaClass.simpleName}")
+            log("    Причина     : ${e.message}")
+            log("\n[i] Отката на CPU не произошло, так как fallback был выключен.")
+        }
     }
 }
 

@@ -9,10 +9,14 @@ android {
 
     defaultConfig {
         applicationId "com.example.litertprobe"
-        minSdk 28
+        minSdk 31
         targetSdk 34
         versionCode 1
         versionName "1.0"
+
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -39,7 +43,8 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
 
-    // Движок TFLite с поддержкой системного NNAPI
-    implementation 'org.tensorflow:tensorflow-lite:2.16.1'
+    // Официальный рантайм LiteRT CompiledModel API
+    implementation 'com.google.ai.edge.litert:litert:2.3.0'
+    implementation 'com.google.ai.edge.litert:litert-gpu:2.3.0'
 }
 
