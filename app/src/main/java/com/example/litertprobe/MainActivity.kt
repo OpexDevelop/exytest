@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private val logBuilder = StringBuilder()
 
-    // Количество фото для бенчмарка (для первичного быстрого теста ставим 30-50, потом можно 1000)
+    // Количество фото для бенчмарка
     private val testBatchSize = 50
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -98,12 +98,14 @@ class MainActivity : AppCompatActivity() {
         }
         log("[+] Найдена модель: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB)")
 
-        val photos = findPhotos()
-        if (photos.isEmpty()) {
+        val photoFiles = findPhotos()
+        if (photoFiles.isEmpty()) {
             log("[-] Фотографии в папке DCIM/Camera не найдены!")
             return@withContext
         }
-        log("[+] Выбрано ${photos.size} реальных фото из галереи\n")
+        log("[*] Загрузка ${photoFiles.size} фото в RAM для исключения дисковых задержек...")
+        val photosData = photoFiles.map { it.readBytes() }
+        log("[+] Фотографии загружены в память (${photosData.sumOf { it.size } / (1024 * 1024)} MB)\n")
 
         // ==========================================
         // 1. ТЕСТ НА CPU
@@ -119,20 +121,20 @@ class MainActivity : AppCompatActivity() {
             val cpuEngine = EmbeddingEngine(cpuConfig)
             val cpuInitTime = System.currentTimeMillis()
             cpuEngine.initialize()
-            log("  [+] CPU движок загружен за ${(System.currentTimeMillis() - cpuInitTime)} ms")
+            log("  [+] CPU движок готов за ${(System.currentTimeMillis() - cpuInitTime)} ms")
 
-            log("  [*] Индексация фото на CPU...")
+            log("  [*] Индексация на CPU...")
             val start = System.currentTimeMillis()
-            for ((index, photo) in photos.withIndex()) {
-                val input = listOf(InputData.Image(photo))
+            for ((index, bytes) in photosData.withIndex()) {
+                val input = listOf(InputData.Image(bytes))
                 val emb = cpuEngine.computeEmbedding(input).embedding
                 if (index == 0) {
                     log("  [✓] Размерность вектора: ${emb.size} Float32 чисел")
                 }
             }
             cpuTotalSec = (System.currentTimeMillis() - start) / 1000.0
-            val cpuFps = photos.size / cpuTotalSec
-            log("  -> CPU общее время: %.2f сек (%.2f фото/сек)".format(cpuTotalSec, cpuFps))
+            val cpuFps = photosData.size / cpuTotalSec
+            log("  -> CPU время: %.2f сек (%.2f фото/сек)".format(cpuTotalSec, cpuFps))
             cpuEngine.close()
         } catch (e: Throwable) {
             log("[-] Ошибка на CPU: ${e.message}")
@@ -151,35 +153,35 @@ class MainActivity : AppCompatActivity() {
             val gpuEngine = EmbeddingEngine(gpuConfig)
             val gpuInitTime = System.currentTimeMillis()
             gpuEngine.initialize()
-            log("  [+] GPU шейдеры скомпилированы за ${(System.currentTimeMillis() - gpuInitTime)} ms")
+            log("  [+] GPU пайплайн готов за ${(System.currentTimeMillis() - gpuInitTime)} ms")
 
-            log("  [*] Индексация тех же фото на GPU...")
+            log("  [*] Индексация на GPU...")
             val start = System.currentTimeMillis()
-            for (photo in photos) {
-                val input = listOf(InputData.Image(photo))
+            for (bytes in photosData) {
+                val input = listOf(InputData.Image(bytes))
                 gpuEngine.computeEmbedding(input)
             }
             val gpuTotalSec = (System.currentTimeMillis() - start) / 1000.0
-            val gpuFps = photos.size / gpuTotalSec
-            log("  -> GPU общее время: %.2f сек (%.2f фото/сек)".format(gpuTotalSec, gpuFps))
+            val gpuFps = photosData.size / gpuTotalSec
+            log("  -> GPU время: %.2f сек (%.2f фото/сек)".format(gpuTotalSec, gpuFps))
             gpuEngine.close()
 
             // ==========================================
             // ИТОГИ
             // ==========================================
             val speedup = if (gpuTotalSec > 0) cpuTotalSec / gpuTotalSec else 0.0
-            val est1000Cpu = (cpuTotalSec / photos.size) * 1000.0
-            val est1000Gpu = (gpuTotalSec / photos.size) * 1000.0
+            val est1000Cpu = (cpuTotalSec / photosData.size) * 1000.0
+            val est1000Gpu = (gpuTotalSec / photosData.size) * 1000.0
 
             log("\n====================================")
-            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ (${photos.size} фото):")
+            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ (${photosData.size} фото):")
             log(" CPU время : %.2f сек".format(cpuTotalSec))
             log(" GPU время : %.2f сек".format(gpuTotalSec))
-            log(" Ускорение : %.2fx на GPU".format(speedup))
+            log(" Разница   : %.2fx ускорение".format(speedup))
             log("------------------------------------")
             log(" РАСЧЕТ НА 1000 ФОТО:")
-            log(" На CPU займет: %.1f сек (~%.1f мин)".format(est1000Cpu, est1000Cpu / 60))
-            log(" На GPU займет: %.1f сек (~%.1f мин)".format(est1000Gpu, est1000Gpu / 60))
+            log(" На CPU : %.1f сек (~%.1f мин)".format(est1000Cpu, est1000Cpu / 60))
+            log(" На GPU : %.1f сек (~%.1f мин)".format(est1000Gpu, est1000Gpu / 60))
             log("====================================")
 
         } catch (e: Throwable) {
