@@ -24,18 +24,21 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Download test INT8 model for NPU
+      - name: Accept Android SDK Licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Download test INT8 model
         run: |
           mkdir -p app/src/main/assets
-          curl -L -o app/src/main/assets/model.tflite \
-            https://storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_v1_1.0_224_quant.tflite
+          curl -L -f -o app/src/main/assets/model.tflite \
+            https://raw.githubusercontent.com/google-coral/test_data/master/mobilenet_v1_1.0_224_quant.tflite
 
-      - name: Build APK
-        run: gradle assembleRelease --stacktrace
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: litert-probe-apk
-          path: app/build/outputs/apk/release/*.apk
-          
+          path: app/build/outputs/apk/debug/*.apk
+
