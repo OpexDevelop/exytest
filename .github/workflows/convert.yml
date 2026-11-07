@@ -1,7 +1,7 @@
-name: Convert MERT-330M to TFLite
+name: Convert MERT-v2 FP16
 
 on:
-  workflow_dispatch: # Запуск кнопкой из интерфейса GitHub
+  workflow_dispatch:
 
 jobs:
   convert:
@@ -9,6 +9,11 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set up Swap Space (10GB)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -19,14 +24,15 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers einops ai-edge-torch
+          pip install transformers einops safetensors soundfile ai-edge-torch
 
-      - name: Run MERT-330M Conversion
-        run: python convert_mert_330m.py
+      - name: Run Conversion
+        run: python convert_mert_v2.py
 
-      - name: Upload TFLite Artifact
+      - name: Upload FP16 TFLite
         uses: actions/upload-artifact@v4
         with:
-          name: mert-330m-tflite
-          path: mert_330m_10s.tflite
+          name: mert-v2-fp16
+          path: mert_v2_fp16.tflite
           retention-days: 5
+
