@@ -10,10 +10,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.EmbeddingEngine
-import com.google.ai.edge.litertlm.EmbeddingEngineConfig
-import com.google.ai.edge.litertlm.InputData
+import com.google.ai.edge.litert.Accelerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -25,8 +22,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private val logBuilder = StringBuilder()
 
-    // Количество фото для тестового прогона (экстраполяция покажет время на 1000)
-    private val testBatchSize = 30
+    // Количество треков для бенчмарка
+    private val testTrackCount = 3
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,7 +36,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         if (checkPermissions()) {
             lifecycleScope.launch {
-                runBenchmarkPipeline()
+                runAudioBenchmark()
             }
         }
     }
@@ -54,7 +51,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkPermissions(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            log("[!] Предоставьте доступ ко всем файлам для чтения фото и модели.")
+            log("[!] Предоставьте доступ ко всем файлам.")
             try {
                 val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
                     data = Uri.parse("package:$packageName")
@@ -71,138 +68,116 @@ class MainActivity : AppCompatActivity() {
     private fun findModel(): File? {
         val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val files = downloadDir.listFiles { _, name ->
-            name.contains("embeddinggemma", ignoreCase = true) && name.endsWith(".litertlm")
+            name.contains("mert", ignoreCase = true) && name.endsWith(".tflite")
         }
         return files?.firstOrNull()
     }
 
-    private fun findPhotos(): List<File> {
-        val dcimDir = File(Environment.getExternalStorageDirectory(), "DCIM/Camera")
-        if (!dcimDir.exists()) return emptyList()
+    private fun findAudioFiles(): List<File> {
+        val validExts = setOf("mp3", "flac", "wav", "m4a", "ogg")
+        val searchDirs = listOf(
+            File(Environment.getExternalStorageDirectory(), "Music"),
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        )
 
-        val validExts = setOf("jpg", "jpeg", "png", "webp")
-        return dcimDir.listFiles { file ->
-            file.isFile && file.extension.lowercase() in validExts
-        }?.take(testBatchSize)?.toList() ?: emptyList()
+        for (dir in searchDirs) {
+            if (!dir.exists()) continue
+            val found = dir.walkTopDown()
+                .filter { it.isFile && it.extension.lowercase() in validExts }
+                .take(testTrackCount)
+                .toList()
+            if (found.isNotEmpty()) return found
+        }
+        return emptyList()
     }
 
-    private suspend fun runBenchmarkPipeline() = withContext(Dispatchers.IO) {
-        log("=== БЕНЧМАРК EMBEDDING GEMMA 2 ===")
+    private suspend fun runAudioBenchmark() = withContext(Dispatchers.IO) {
+        log("=== БЕНЧМАРК MERT-330M FULL TRACK ===")
         log("SoC: ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}\n")
 
         val modelFile = findModel()
         if (modelFile == null) {
-            log("[-] ОШИБКА: Файл модели *.litertlm не найден в /sdcard/Download/")
+            log("[-] ОШИБКА: Модель mert*.tflite не найдена в /sdcard/Download/")
             return@withContext
         }
         log("[+] Модель: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB)")
 
-        val photoFiles = findPhotos()
-        if (photoFiles.isEmpty()) {
-            log("[-] ОШИБКА: Фотографии в DCIM/Camera не найдены")
+        val audioFiles = findAudioFiles()
+        if (audioFiles.isEmpty()) {
+            log("[-] ОШИБКА: Аудиофайлы (mp3/flac/m4a) не найдены в /sdcard/Music или Download")
             return@withContext
         }
-        log("[+] Найдено ${photoFiles.size} фото для теста (потоковая обработка по 1 фото)\n")
+        log("[+] Найдено треков: ${audioFiles.size}\n")
 
         // ==========================================
-        // 1. ПРОГОН НА ЧИСТОМ CPU
+        // 1. ТЕСТ НА CPU
         // ==========================================
-        log("[*] 1. Инициализация EmbeddingEngine на CPU...")
-        var cpuInferenceNs = 0L
-        var cpuSuccessCount = 0
+        log("[*] 1. Инициализация FullTrackProcessor на CPU...")
+        var cpuTotalInfMs = 0L
+        var cpuTotalChunks = 0
 
         try {
-            val cpuConfig = EmbeddingEngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.CPU(),
-                visionBackend = Backend.CPU()
-            )
-            val cpuEngine = EmbeddingEngine(cpuConfig)
-            val initStart = System.currentTimeMillis()
-            cpuEngine.initialize()
-            log("  [+] Инициализация CPU заняла ${System.currentTimeMillis() - initStart} ms")
+            val cpuProcessor = FullTrackProcessor(modelFile, Accelerator.CPU)
+            log("  [+] Модель загружена на CPU")
 
-            log("  [*] Обработка фотографий на CPU...")
-            for ((index, file) in photoFiles.withIndex()) {
-                val bytes = file.readBytes()
-                val input = listOf(InputData.Image(bytes))
+            for ((i, file) in audioFiles.withIndex()) {
+                log("  [*] [CPU ${i + 1}/${audioFiles.size}] Обработка: ${file.name}...")
+                val res = cpuProcessor.processFullTrack(file)
+                cpuTotalInfMs += res.inferenceMs
+                cpuTotalChunks += res.chunkCount
 
-                val t0 = System.nanoTime()
-                val output = cpuEngine.computeEmbedding(input)
-                cpuInferenceNs += (System.nanoTime() - t0)
-                cpuSuccessCount++
-
-                if (index == 0) {
-                    log("  [✓] Длина выходного вектора: ${output.embedding.size} float")
-                }
+                log("      Чанков: ${res.chunkCount} | Декод: ${res.decodeMs} ms | Инференс: ${res.inferenceMs} ms")
             }
-
-            val cpuTotalSec = cpuInferenceNs / 1_000_000_000.0
-            val cpuFps = cpuSuccessCount / cpuTotalSec
-            log("  -> Время чистого инференса CPU: %.2f сек (%.2f фото/сек)".format(cpuTotalSec, cpuFps))
-            cpuEngine.close()
+            cpuProcessor.close()
         } catch (e: Throwable) {
-            log("[-] Сбой CPU: ${e.message}")
+            log("[-] Ошибка CPU: ${e.message}")
         }
 
         // ==========================================
-        // 2. ПРОГОН НА GPU (AMD Xclipse)
+        // 2. ТЕСТ НА GPU (AMD Xclipse)
         // ==========================================
-        log("\n[*] 2. Инициализация EmbeddingEngine на GPU...")
-        var gpuInferenceNs = 0L
-        var gpuSuccessCount = 0
+        log("\n[*] 2. Инициализация FullTrackProcessor на GPU...")
+        var gpuTotalInfMs = 0L
+        var gpuTotalChunks = 0
 
         try {
-            val gpuConfig = EmbeddingEngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.GPU(),
-                visionBackend = Backend.GPU()
-            )
-            val gpuEngine = EmbeddingEngine(gpuConfig)
-            val initStart = System.currentTimeMillis()
-            gpuEngine.initialize()
-            log("  [+] Компиляция GPU пайплайна заняла ${System.currentTimeMillis() - initStart} ms")
+            val gpuProcessor = FullTrackProcessor(modelFile, Accelerator.GPU)
+            log("  [+] Шейдеры скомпилированы на GPU")
 
-            log("  [*] Обработка фотографий на GPU...")
-            for (file in photoFiles) {
-                val bytes = file.readBytes()
-                val input = listOf(InputData.Image(bytes))
+            for ((i, file) in audioFiles.withIndex()) {
+                log("  [*] [GPU ${i + 1}/${audioFiles.size}] Обработка: ${file.name}...")
+                val res = gpuProcessor.processFullTrack(file)
+                gpuTotalInfMs += res.inferenceMs
+                gpuTotalChunks += res.chunkCount
 
-                val t0 = System.nanoTime()
-                gpuEngine.computeEmbedding(input)
-                gpuInferenceNs += (System.nanoTime() - t0)
-                gpuSuccessCount++
+                log("      Чанков: ${res.chunkCount} | Декод: ${res.decodeMs} ms | Инференс: ${res.inferenceMs} ms")
             }
-
-            val gpuTotalSec = gpuInferenceNs / 1_000_000_000.0
-            val gpuFps = gpuSuccessCount / gpuTotalSec
-            log("  -> Время чистого инференса GPU: %.2f сек (%.2f фото/сек)".format(gpuTotalSec, gpuFps))
-            gpuEngine.close()
+            gpuProcessor.close()
 
             // ==========================================
-            // ИТОГОВОЕ СРАВНЕНИЕ
+            // ИТОГИ
             // ==========================================
-            if (cpuSuccessCount > 0 && gpuSuccessCount > 0) {
-                val cpuSec = cpuInferenceNs / 1_000_000_000.0
-                val gpuSec = gpuInferenceNs / 1_000_000_000.0
-                val speedup = cpuSec / gpuSec
-
-                val est1000CpuSec = (cpuSec / cpuSuccessCount) * 1000.0
-                val est1000GpuSec = (gpuSec / gpuSuccessCount) * 1000.0
+            if (cpuTotalChunks > 0 && gpuTotalChunks > 0) {
+                val cpuAvgChunkMs = cpuTotalInfMs.toDouble() / cpuTotalChunks
+                val gpuAvgChunkMs = gpuTotalInfMs.toDouble() / gpuTotalChunks
+                val speedup = cpuAvgChunkMs / gpuAvgChunkMs
 
                 log("\n====================================")
-                log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ ($testBatchSize фото):")
-                log(" Чистый CPU : %.2f сек".format(cpuSec))
-                log(" Чистый GPU : %.2f сек".format(gpuSec))
-                log(" Разница    : %.2fx ускорение".format(speedup))
+                log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ ($cpuTotalChunks чанков по 10 сек):")
+                log(" CPU среднее на чанк : %.0f ms".format(cpuAvgChunkMs))
+                log(" GPU среднее на чанк : %.0f ms".format(gpuAvgChunkMs))
+                log(" Разница             : %.2fx ускорение".format(speedup))
                 log("------------------------------------")
-                log(" ПРОГНОЗ НА 1000 ФОТО:")
-                log(" CPU : %.1f сек (%.1f мин)".format(est1000CpuSec, est1000CpuSec / 60))
-                log(" GPU : %.1f сек (%.1f мин)".format(est1000GpuSec, est1000GpuSec / 60))
+                val track3MinChunks = 35 // 3 минуты с шагом 5 сек = 35 окон
+                val est3MinCpuSec = (cpuAvgChunkMs * track3MinChunks) / 1000.0
+                val est3MinGpuSec = (gpuAvgChunkMs * track3MinChunks) / 1000.0
+                log(" РАСЧЕТ НА ТРЕК 3 МИНУТЫ:")
+                log(" CPU : %.1f сек".format(est3MinCpuSec))
+                log(" GPU : %.1f сек".format(est3MinGpuSec))
                 log("====================================")
             }
         } catch (e: Throwable) {
-            log("[-] Сбой GPU: ${e.message}")
+            log("[-] Ошибка GPU: ${e.message}")
         }
     }
 }
