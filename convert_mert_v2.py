@@ -1,11 +1,21 @@
 import sys
-from unittest.mock import MagicMock
+import types
+import importlib.machinery
 
-# Заглушка для torchaudio, который больше не выпускается под новый PyTorch 2.14+,
-# но проверяется dynamic_module_utils при импорте кода MERT-v2 с Hugging Face
-sys.modules["torchaudio"] = MagicMock()
-sys.modules["torchaudio.functional"] = MagicMock()
-sys.modules["torchaudio.transforms"] = MagicMock()
+# Полноценная заглушка со спецификацией модуля для Python 3.11+ и transformers
+def register_dummy_module(name):
+    mod = types.ModuleType(name)
+    mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+    mod.__version__ = "2.6.0"
+    mod.__path__ = []
+    sys.modules[name] = mod
+    return mod
+
+ta = register_dummy_module("torchaudio")
+ta.functional = register_dummy_module("torchaudio.functional")
+ta.transforms = register_dummy_module("torchaudio.transforms")
+ta.compliance = register_dummy_module("torchaudio.compliance")
+ta.compliance.kaldi = register_dummy_module("torchaudio.compliance.kaldi")
 
 import torch
 import torch.nn as nn
@@ -23,15 +33,13 @@ class MERTv2FullSongWrapper(nn.Module):
         self.mert.eval()
 
     def forward(self, input_values, attention_mask):
-        # input_values: [1, N_SAMPLES], attention_mask: [1, N_SAMPLES] (1 - звук, 0 - паддинг)
         outputs = self.mert(
             input_values=input_values,
             attention_mask=attention_mask,
             output_hidden_states=False
         )
-        frames = outputs.last_hidden_state  # [1, frames, 1024] (25 Hz)
+        frames = outputs.last_hidden_state  # [1, frames, 1024]
         
-        # Штатное усреднение MERT-v2-FullSong по маске реальной длины песни
         mask = outputs.feature_attention_mask.unsqueeze(-1).to(frames.dtype)
         embedding = (frames * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         
@@ -40,8 +48,7 @@ class MERTv2FullSongWrapper(nn.Module):
 print("[1/3] Загрузка MERT-v2-FullSong (632M)...")
 model = MERTv2FullSongWrapper().eval()
 
-# Полный трек: 180 секунд (3 минуты) при 24 000 Гц = 4 320 000 сэмплов
-# Если нужно 4 минуты — поставь 240 * 24000 = 5_760_000
+# 180 секунд (3 минуты) при 24 000 Гц = 4 320 000 сэмплов
 FULL_SONG_SAMPLES = 180 * 24000
 
 sample_waveform = torch.zeros(1, FULL_SONG_SAMPLES, dtype=torch.float32)
