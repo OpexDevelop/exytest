@@ -1,12 +1,23 @@
 package com.example.litertprobe
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import com.google.ai.edge.litert.Accelerator
-import com.google.ai.edge.litert.CompiledModel
+import androidx.lifecycle.lifecycleScope
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.EmbeddingEngine
+import com.google.ai.edge.litertlm.EmbeddingEngineConfig
+import com.google.ai.edge.litertlm.InputData
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -14,15 +25,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollView: ScrollView
     private val logBuilder = StringBuilder()
 
+    // Количество фото для бенчмарка (для первичного быстрого теста ставим 30-50, потом можно 1000)
+    private val testBatchSize = 50
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         logView = findViewById(R.id.logText)
         scrollView = findViewById(R.id.scrollView)
+    }
 
-        Thread {
-            runCompiledModelAudit()
-        }.start()
+    override fun onResume() {
+        super.onResume()
+        if (checkPermissions()) {
+            lifecycleScope.launch {
+                runEmbeddingBenchmark()
+            }
+        }
     }
 
     private fun log(msg: String) {
@@ -33,104 +52,138 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun runCompiledModelAudit() {
-        log("=== LITERТ COMPILED MODEL AUDIT ===")
-        log("SoC     : ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
-        log("Система : Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
-
-        val modelAsset = "model.tflite"
-        val inputSize = 1 * 224 * 224 * 3
-        val inputData = FloatArray(inputSize) { 0.5f }
-        val iterations = 10
-
-        // 1. Тест на CPU
-        log("[*] 1. Запуск CompiledModel(Accelerator.CPU)...")
-        var cpuAvgMs = 0.0
-        try {
-            val cpuModel = CompiledModel.create(
-                assets,
-                modelAsset,
-                CompiledModel.Options(Accelerator.CPU)
-            )
-            val cpuInputs = cpuModel.createInputBuffers()
-            val cpuOutputs = cpuModel.createOutputBuffers()
-            cpuInputs[0].writeFloat(inputData)
-            cpuModel.run(cpuInputs, cpuOutputs)
-
-            val start = System.nanoTime()
-            for (i in 0 until iterations) {
-                cpuInputs[0].writeFloat(inputData)
-                cpuModel.run(cpuInputs, cpuOutputs)
+    private fun checkPermissions(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            log("[!] Требуется доступ к памяти для чтения фото из DCIM и модели из Download.")
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
             }
-            cpuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
-            log("  -> Время на CPU: %.2f ms".format(cpuAvgMs))
-            cpuModel.close()
+            return false
+        }
+        return true
+    }
+
+    private fun findModel(): File? {
+        val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val files = downloadDir.listFiles { _, name -> 
+            name.contains("embeddinggemma", ignoreCase = true) && name.endsWith(".litertlm") 
+        }
+        return files?.firstOrNull()
+    }
+
+    private fun findPhotos(): List<File> {
+        val dcimDir = File(Environment.getExternalStorageDirectory(), "DCIM/Camera")
+        if (!dcimDir.exists()) return emptyList()
+
+        val validExtensions = setOf("jpg", "jpeg", "png", "webp")
+        return dcimDir.listFiles { file ->
+            file.isFile && file.extension.lowercase() in validExtensions
+        }?.take(testBatchSize)?.toList() ?: emptyList()
+    }
+
+    private suspend fun runEmbeddingBenchmark() = withContext(Dispatchers.IO) {
+        log("=== БЕНЧМАРК EMBEDDING GEMMA 2 ===")
+        log("Чипсет: ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}\n")
+
+        val modelFile = findModel()
+        if (modelFile == null) {
+            log("[-] Файл модели не найден в папке Загрузки!")
+            log("    Положи файл *.litertlm (например embeddinggemma-2-740m.litertlm) в /sdcard/Download/")
+            return@withContext
+        }
+        log("[+] Найдена модель: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB)")
+
+        val photos = findPhotos()
+        if (photos.isEmpty()) {
+            log("[-] Фотографии в папке DCIM/Camera не найдены!")
+            return@withContext
+        }
+        log("[+] Выбрано ${photos.size} реальных фото из галереи\n")
+
+        // ==========================================
+        // 1. ТЕСТ НА CPU
+        // ==========================================
+        log("[*] 1. Инициализация EmbeddingEngine на CPU...")
+        var cpuTotalSec = 0.0
+        try {
+            val cpuConfig = EmbeddingEngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = Backend.CPU(),
+                visionBackend = Backend.CPU()
+            )
+            val cpuEngine = EmbeddingEngine(cpuConfig)
+            val cpuInitTime = System.currentTimeMillis()
+            cpuEngine.initialize()
+            log("  [+] CPU движок загружен за ${(System.currentTimeMillis() - cpuInitTime)} ms")
+
+            log("  [*] Индексация фото на CPU...")
+            val start = System.currentTimeMillis()
+            for ((index, photo) in photos.withIndex()) {
+                val input = listOf(InputData.Image(photo))
+                val emb = cpuEngine.computeEmbedding(input).embedding
+                if (index == 0) {
+                    log("  [✓] Размерность вектора: ${emb.size} Float32 чисел")
+                }
+            }
+            cpuTotalSec = (System.currentTimeMillis() - start) / 1000.0
+            val cpuFps = photos.size / cpuTotalSec
+            log("  -> CPU общее время: %.2f сек (%.2f фото/сек)".format(cpuTotalSec, cpuFps))
+            cpuEngine.close()
         } catch (e: Throwable) {
             log("[-] Ошибка на CPU: ${e.message}")
         }
 
-        // 2. Тест на GPU (для аппаратного ориентира графики AMD Xclipse)
-        log("\n[*] 2. Запуск CompiledModel(Accelerator.GPU)...")
-        var gpuAvgMs = 0.0
+        // ==========================================
+        // 2. ТЕСТ НА GPU (AMD Xclipse)
+        // ==========================================
+        log("\n[*] 2. Инициализация EmbeddingEngine на GPU...")
         try {
-            val gpuModel = CompiledModel.create(
-                assets,
-                modelAsset,
-                CompiledModel.Options(Accelerator.GPU)
+            val gpuConfig = EmbeddingEngineConfig(
+                modelPath = modelFile.absolutePath,
+                backend = Backend.GPU(),
+                visionBackend = Backend.GPU()
             )
-            val gpuInputs = gpuModel.createInputBuffers()
-            val gpuOutputs = gpuModel.createOutputBuffers()
-            gpuInputs[0].writeFloat(inputData)
-            gpuModel.run(gpuInputs, gpuOutputs)
+            val gpuEngine = EmbeddingEngine(gpuConfig)
+            val gpuInitTime = System.currentTimeMillis()
+            gpuEngine.initialize()
+            log("  [+] GPU шейдеры скомпилированы за ${(System.currentTimeMillis() - gpuInitTime)} ms")
 
-            val start = System.nanoTime()
-            for (i in 0 until iterations) {
-                gpuInputs[0].writeFloat(inputData)
-                gpuModel.run(gpuInputs, gpuOutputs)
+            log("  [*] Индексация тех же фото на GPU...")
+            val start = System.currentTimeMillis()
+            for (photo in photos) {
+                val input = listOf(InputData.Image(photo))
+                gpuEngine.computeEmbedding(input)
             }
-            gpuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
-            log("  -> Время на GPU: %.2f ms".format(gpuAvgMs))
-            gpuModel.close()
-        } catch (e: Throwable) {
-            log("[-] Ошибка на GPU: ${e.message}")
-        }
+            val gpuTotalSec = (System.currentTimeMillis() - start) / 1000.0
+            val gpuFps = photos.size / gpuTotalSec
+            log("  -> GPU общее время: %.2f сек (%.2f фото/сек)".format(gpuTotalSec, gpuFps))
+            gpuEngine.close()
 
-        // 3. Тест на NPU
-        log("\n[*] 3. Запуск CompiledModel(Accelerator.NPU)...")
-        try {
-            val npuInitStart = System.currentTimeMillis()
-            val npuModel = CompiledModel.create(
-                assets,
-                modelAsset,
-                CompiledModel.Options(Accelerator.NPU)
-            )
-            val npuInitMs = System.currentTimeMillis() - npuInitStart
-            log("  [+] Время создания NPU-модели: ${npuInitMs} ms")
-
-            val npuInputs = npuModel.createInputBuffers()
-            val npuOutputs = npuModel.createOutputBuffers()
-            npuInputs[0].writeFloat(inputData)
-            npuModel.run(npuInputs, npuOutputs)
-
-            val start = System.nanoTime()
-            for (i in 0 until iterations) {
-                npuInputs[0].writeFloat(inputData)
-                npuModel.run(npuInputs, npuOutputs)
-            }
-            val npuAvgMs = ((System.nanoTime() - start) / 1_000_000.0) / iterations
-            log("  -> Время на NPU: %.2f ms".format(npuAvgMs))
+            // ==========================================
+            // ИТОГИ
+            // ==========================================
+            val speedup = if (gpuTotalSec > 0) cpuTotalSec / gpuTotalSec else 0.0
+            val est1000Cpu = (cpuTotalSec / photos.size) * 1000.0
+            val est1000Gpu = (gpuTotalSec / photos.size) * 1000.0
 
             log("\n====================================")
-            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ:")
-            log(" CPU : %.2f ms".format(cpuAvgMs))
-            log(" GPU : %.2f ms".format(gpuAvgMs))
-            log(" NPU : %.2f ms".format(npuAvgMs))
+            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ (${photos.size} фото):")
+            log(" CPU время : %.2f сек".format(cpuTotalSec))
+            log(" GPU время : %.2f сек".format(gpuTotalSec))
+            log(" Ускорение : %.2fx на GPU".format(speedup))
+            log("------------------------------------")
+            log(" РАСЧЕТ НА 1000 ФОТО:")
+            log(" На CPU займет: %.1f сек (~%.1f мин)".format(est1000Cpu, est1000Cpu / 60))
+            log(" На GPU займет: %.1f сек (~%.1f мин)".format(est1000Gpu, est1000Gpu / 60))
             log("====================================")
 
-            npuModel.close()
         } catch (e: Throwable) {
-            log("\n[-] Ошибка инициализации NPU:")
-            log("    ${e.javaClass.simpleName}: ${e.message}")
+            log("[-] Ошибка на GPU: ${e.message}")
         }
     }
 }
