@@ -24,8 +24,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install litert-torch transformers einops safetensors soundfile
-          # Ставим последний доступный torchaudio без перезаписи torch 2.14
-          pip install torchaudio --no-deps
 
       - name: Run FullSong Conversion
         run: python convert_mert_v2.py
@@ -33,7 +31,7 @@ jobs:
       - name: Upload TFLite Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mert-v2-fullsong-tflite
-          path: mert_v2_fullsong.tflite
+          name: mert-v2-backbone-tflite
+          path: mert_v2_backbone.tflite
           retention-days: 5
 
