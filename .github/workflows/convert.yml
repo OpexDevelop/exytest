@@ -22,17 +22,23 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers einops safetensors soundfile ai-edge-torch
+          python -m pip install --upgrade pip
+          
+          # 1. Ставим актуальный litert-torch и transformers
+          pip install litert-torch transformers einops safetensors soundfile
+          
+          # 2. Подтягиваем torchaudio СТРОГО той же версии, что подтянул torch
+          TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+          echo "Detected PyTorch version: $TORCH_VER"
+          pip install "torchaudio==$TORCH_VER" --no-deps
 
       - name: Run Conversion
         run: python convert_mert_v2.py
 
-      - name: Upload FP16 TFLite
+      - name: Upload TFLite Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mert-v2-fp16
-          path: mert_v2_fp16.tflite
+          name: mert-v2-fp-tflite
+          path: mert_v2_30s.tflite
           retention-days: 5
 
