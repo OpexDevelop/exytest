@@ -1,66 +1,33 @@
 package com.example.litertprobe
 
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
-import android.provider.Settings
-import android.widget.Button
-import android.widget.EditText
+import android.system.Os
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.lifecycle.lifecycleScope
-import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Conversation
-import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.Message
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import org.tensorflow.lite.Interpreter
 import java.io.File
-import java.util.concurrent.Executors
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var logView: TextView
     private lateinit var scrollView: ScrollView
-    private lateinit var inputPrompt: EditText
-    private lateinit var btnSend: Button
-
     private val logBuilder = StringBuilder()
-    private val lmExecutor = Executors.newSingleThreadExecutor()
-    private val lmDispatcher = lmExecutor.asCoroutineDispatcher()
-
-    private var engine: Engine? = null
-    private var conversation: Conversation? = null
-    private var isInitializing = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
         logView = findViewById(R.id.logText)
         scrollView = findViewById(R.id.scrollView)
-        inputPrompt = findViewById(R.id.inputPrompt)
-        btnSend = findViewById(R.id.btnSend)
 
-        btnSend.setOnClickListener {
-            val text = inputPrompt.text.toString().trim()
-            if (text.isNotEmpty()) {
-                inputPrompt.setText("")
-                sendUserMessage(text)
-            }
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        checkPermissionsAndStart()
+        Thread {
+            runRigorousHardwareProbe()
+        }.start()
     }
 
     private fun log(msg: String) {
@@ -71,147 +38,131 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun appendStream(chunk: String) {
-        logBuilder.append(chunk)
-        runOnUiThread {
-            logView.text = logBuilder.toString()
-            scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
-        }
-    }
-
-    private fun checkPermissionsAndStart() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            log("[!] Требуется разрешение на чтение файла 2.6 ГБ из Загрузок.")
-            log("[*] Открываю настройки... Переключите тумблер 'Разрешить доступ' и вернитесь.")
-            try {
-                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(intent)
-            } catch (e: Exception) {
-                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+    private fun checkActiveKernelNpuNode(): String? {
+        try {
+            val fdDir = File("/proc/self/fd")
+            val fds = fdDir.listFiles() ?: return null
+            for (fd in fds) {
+                try {
+                    val target = Os.readlink(fd.absolutePath)
+                    if (target.contains("vertex") || target.contains("enn")) {
+                        return "${fd.name} -> $target"
+                    }
+                } catch (_: Exception) {}
             }
-            return
-        }
-
-        if (engine == null && !isInitializing) {
-            lifecycleScope.launch {
-                initModelPipeline()
-            }
-        }
-    }
-
-    private fun findModelFile(): File? {
-        val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val defaultFile = File(downloadDir, "gemma-4-E2B-it_NPU_Uncompiled.litertlm")
-        if (defaultFile.exists() && defaultFile.isFile) return defaultFile
-
-        val files = downloadDir.listFiles { _, name -> name.endsWith(".litertlm") }
-        if (!files.isNullOrEmpty()) return files[0]
-
+        } catch (_: Exception) {}
         return null
     }
 
-    private suspend fun initModelPipeline() = withContext(lmDispatcher) {
-        isInitializing = true
-        log("=== LiteRT-LM Exynos NPU Launcher ===")
-        log("Чипсет: ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
+    private fun runRigorousHardwareProbe() {
+        log("=== АППАРАТНЫЙ АУДИТ NPU EXYNOS ===")
+        log("SoC: ${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE}")
+        log("Ядро: ${System.getProperty("os.version")}\n")
 
-        val modelFile = findModelFile()
-        if (modelFile == null) {
-            log("\n[-] Файл модели не найден в папке Загрузки!")
-            log("    Ожидался: /sdcard/Download/gemma-4-E2B-it_NPU_Uncompiled.litertlm")
-            isInitializing = false
-            return@withContext
-        }
-
-        log("[+] Найден файл: ${modelFile.name} (${modelFile.length() / (1024 * 1024)} MB)")
-        log("[*] Запуск компиляции и загрузки графа в NPU...")
-        log("    (Внимание: первый старт On-Device NPU занимает 1-2 минуты!)")
-
-        val startTime = System.currentTimeMillis()
-
+        val modelBuffer: ByteBuffer
         try {
-            val config = EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.NPU(nativeLibraryDir = applicationInfo.nativeLibraryDir),
-                cacheDir = cacheDir.path
-            )
-
-            val newEngine = Engine(config)
-            newEngine.initialize()
-
-            engine = newEngine
-            conversation = newEngine.createConversation()
-
-            val loadSec = (System.currentTimeMillis() - startTime) / 1000.0
-            log("\n[✓] NPU успешно инициализирован за ${loadSec}s!")
-            log("----------------------------------------")
-
-            runOnUiThread { btnSend.isEnabled = true }
-
-            sendUserMessage("Say hello and confirm you are running on NPU in one short sentence.")
-
-        } catch (e: Throwable) {
-            log("\n[-] Ошибка загрузки NPU бэкенда: ${e.message}")
-            log("    Попытка аварийного отката на GPU...")
-            tryFallbackToGpu(modelFile)
-        } finally {
-            isInitializing = false
+            modelBuffer = loadModelFile("model.tflite")
+            log("[+] Модель INT8 успешно загружена в память")
+        } catch (e: Exception) {
+            log("[-] Ошибка чтения модели: ${e.message}")
+            return
         }
-    }
 
-    private suspend fun tryFallbackToGpu(modelFile: File) {
+        // Подготовка тестового тензора (MobileNet INT8: 1x224x224x3)
+        val inputSize = 1 * 224 * 224 * 3
+        val inputBuffer = ByteBuffer.allocateDirect(inputSize).order(ByteOrder.nativeOrder())
+        for (i in 0 until inputSize) inputBuffer.put((i % 256).toByte())
+        val outputBuffer = ByteBuffer.allocateDirect(1001).order(ByteOrder.nativeOrder())
+
+        val iterations = 10
+
+        // ==========================================
+        // ТЕСТ 1: Принудительный чистый CPU
+        // ==========================================
+        log("\n[*] 1. Запуск на ЧИСТОМ CPU (4 потока, NNAPI выключен)...")
+        val cpuOptions = Interpreter.Options().apply {
+            setUseNNAPI(false)
+            setNumThreads(4)
+        }
+        val cpuInterpreter = Interpreter(modelBuffer, cpuOptions)
+
+        // Прогрев CPU
+        inputBuffer.rewind(); outputBuffer.rewind()
+        cpuInterpreter.run(inputBuffer, outputBuffer)
+
+        val cpuStart = System.nanoTime()
+        for (i in 0 until iterations) {
+            inputBuffer.rewind(); outputBuffer.rewind()
+            cpuInterpreter.run(inputBuffer, outputBuffer)
+        }
+        val cpuTimeMs = ((System.nanoTime() - cpuStart) / 1_000_000.0) / iterations
+        log("  -> Время на CPU: %.2f ms".format(cpuTimeMs))
+        cpuInterpreter.close()
+
+        // ==========================================
+        // ТЕСТ 2: Аппаратный NPU (Samsung Exynos HAL)
+        // ==========================================
+        log("\n[*] 2. Запуск на NPU (активация драйвера Exynos LiteCore)...")
+        val npuOptions = Interpreter.Options().apply {
+            setUseNNAPI(true)
+        }
+
+        var npuInterpreter: Interpreter? = null
         try {
-            val gpuConfig = EngineConfig(
-                modelPath = modelFile.absolutePath,
-                backend = Backend.GPU(),
-                cacheDir = cacheDir.path
-            )
-            val newEngine = Engine(gpuConfig)
-            newEngine.initialize()
-            engine = newEngine
-            conversation = newEngine.createConversation()
-            log("[✓] GPU fallback успешен!")
-            runOnUiThread { btnSend.isEnabled = true }
-        } catch (e: Throwable) {
-            log("[-] Ошибка GPU fallback: ${e.message}")
-        }
-    }
+            npuInterpreter = Interpreter(modelBuffer, npuOptions)
 
-    private fun sendUserMessage(prompt: String) {
-        val conv = conversation ?: return
-        btnSend.isEnabled = false
+            // Прогрев NPU и компиляция подграфа
+            inputBuffer.rewind(); outputBuffer.rewind()
+            npuInterpreter.run(inputBuffer, outputBuffer)
 
-        log("\nUser: $prompt")
-        appendStream("Gemma 4: ")
-
-        lifecycleScope.launch(lmDispatcher) {
-            val start = System.currentTimeMillis()
-            conv.sendMessageAsync(prompt)
-                .catch { err: Throwable ->
-                    log("\n[-] Ошибка инференса: ${err.message}")
-                }
-                .collect { chunk: Message ->
-                    appendStream(chunk.toString())
-                }
-
-            val totalSec = (System.currentTimeMillis() - start) / 1000.0
-            log("\n[Генерация завершена за ${totalSec}s]")
-            runOnUiThread { btnSend.isEnabled = true }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        lmExecutor.execute {
-            try {
-                conversation?.close()
-                engine?.close()
-            } catch (e: Exception) {
-                // игнорируем ошибки закрытия
+            // Проверка файлового дескриптора ядра Linux
+            val activeNode = checkActiveKernelNpuNode()
+            if (activeNode != null) {
+                log("  [✓] ПОДТВЕРЖДЕНИЕ ЯДРА: Дескриптор открыт: $activeNode")
+            } else {
+                log("  [?] Дескриптор ядра не обнаружен напрямую (SELinux ограничение)")
             }
+
+            val npuStart = System.nanoTime()
+            for (i in 0 until iterations) {
+                inputBuffer.rewind(); outputBuffer.rewind()
+                npuInterpreter.run(inputBuffer, outputBuffer)
+            }
+            val npuTimeMs = ((System.nanoTime() - npuStart) / 1_000_000.0) / iterations
+            log("  -> Время на NPU: %.2f ms".format(npuTimeMs))
+
+            // ==========================================
+            // ИТОГОВЫЙ ВЕРДИКТ
+            // ==========================================
+            val speedup = cpuTimeMs / npuTimeMs
+            log("\n====================================")
+            log(" РЕЗУЛЬТАТЫ СРАВНЕНИЯ:")
+            log(" CPU (4 ядра) : %.2f ms".format(cpuTimeMs))
+            log(" NPU Exynos   : %.2f ms".format(npuTimeMs))
+            log(" Ускорение    : %.1fx".format(speedup))
+            if (speedup >= 3.0) {
+                log(" ВЕРДИКТ: АППАРАТНЫЙ NPU РАБОТАЕТ!")
+            } else {
+                log(" ВЕРДИКТ: Похоже на fallback на процессор")
+            }
+            log("====================================")
+
+        } catch (e: Exception) {
+            log("[-] Ошибка инициализации NPU: ${e.message}")
+        } finally {
+            npuInterpreter?.close()
         }
+    }
+
+    private fun loadModelFile(modelName: String): ByteBuffer {
+        val fileDescriptor = assets.openFd(modelName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        return fileChannel.map(
+            FileChannel.MapMode.READ_ONLY,
+            fileDescriptor.startOffset,
+            fileDescriptor.declaredLength
+        )
     }
 }
 
