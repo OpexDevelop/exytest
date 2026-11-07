@@ -27,11 +27,23 @@ jobs:
       - name: Accept Android SDK Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Download MobileNet Float32 model
+      - name: Generate Float32 Conv Model for NPU
         run: |
           mkdir -p app/src/main/assets
-          curl -L -f -o app/src/main/assets/model.tflite \
-            https://storage.googleapis.com/download.tensorflow.org/models/tflite/mobilenet_v1_1.0_224.tflite
+          pip install --quiet tensorflow-cpu
+          python3 -c '
+          import tensorflow as tf
+          inp = tf.keras.Input(shape=(224, 224, 3), dtype=tf.float32)
+          x = tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu")(inp)
+          x = tf.keras.layers.GlobalAveragePooling2D()(x)
+          out = tf.keras.layers.Dense(1001, activation="softmax")(x)
+          model = tf.keras.Model(inputs=inp, outputs=out)
+          converter = tf.lite.TFLiteConverter.from_keras_model(model)
+          tflite_model = converter.convert()
+          with open("app/src/main/assets/model.tflite", "wb") as f:
+              f.write(tflite_model)
+          print("Модель успешно сгенерирована, размер:", len(tflite_model))
+          '
 
       - name: Build Debug APK
         run: gradle :app:assembleDebug --no-daemon
