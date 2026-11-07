@@ -1,76 +1,28 @@
 import sys
 import types
 import importlib.machinery
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 # =====================================================================
-# 1. ЧИСТАЯ РЕАЛИЗАЦИЯ ТРЕХ КЛАССОВ TORCHAUDIO НА PYTORCH
+# 1. ЗАГЛУШКА TORCHAUDIO TRANSFORMS
 # =====================================================================
 class DummySpectrogram(nn.Module):
-    def __init__(self, n_fft=400, win_length=None, hop_length=None, pad=0, power=2.0, normalized=False, center=True, pad_mode="reflect", onesided=True):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.n_fft = n_fft
-        self.win_length = win_length if win_length is not None else n_fft
-        self.hop_length = hop_length if hop_length is not None else self.win_length // 2
-        self.pad = pad
-        self.power = power
-        self.normalized = normalized
-        self.center = center
-        self.pad_mode = pad_mode
-        self.onesided = onesided
-        self.register_buffer("window", torch.hann_window(self.win_length))
-
-    def forward(self, x):
-        window = self.window.to(dtype=x.dtype, device=x.device)
-        stft = torch.stft(
-            x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=window,
-            center=self.center,
-            pad_mode=self.pad_mode,
-            normalized=self.normalized,
-            onesided=self.onesided,
-            return_complex=True
-        )
-        if self.power is not None:
-            return torch.abs(stft).pow(self.power)
-        return stft
+    def forward(self, x): return x
 
 class DummyMelScale(nn.Module):
-    def __init__(self, n_mels=128, sample_rate=16000, f_min=0.0, f_max=None, n_stft=201, norm=None, mel_scale="htk"):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.n_mels = n_mels
-        self.sample_rate = sample_rate
-        self.f_max = f_max if f_max is not None else float(sample_rate // 2)
-        self.f_min = f_min
-        self.norm = norm
-        self.n_stft = n_stft
-        # Простая инициализация фильтр-банка
-        fb = torch.zeros(n_stft, n_mels)
-        self.register_buffer("fb", fb)
-
-    def forward(self, specgram):
-        return torch.matmul(specgram.transpose(-1, -2), self.fb).transpose(-1, -2)
+    def forward(self, x): return x
 
 class DummyAmplitudeToDB(nn.Module):
-    def __init__(self, multiplier=10.0, amin=1e-10, db_multiplier=0.0, top_db=80.0):
+    def __init__(self, *args, **kwargs):
         super().__init__()
-        self.multiplier = multiplier
-        self.amin = amin
-        self.top_db = top_db
+    def forward(self, x): return x
 
-    def forward(self, x):
-        x_db = self.multiplier * torch.log10(torch.clamp(x, min=self.amin))
-        if self.top_db is not None:
-            x_db = torch.maximum(x_db, x_db.max() - self.top_db)
-        return x_db
-
-# Регистрируем модуль в sys.modules чтобы huggingface-код MERT увидел torchaudio.transforms
 def make_module(name):
     m = types.ModuleType(name)
     m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
@@ -83,45 +35,63 @@ mod_tat.Spectrogram = DummySpectrogram
 mod_tat.MelScale = DummyMelScale
 mod_tat.AmplitudeToDB = DummyAmplitudeToDB
 mod_ta.transforms = mod_tat
-
 sys.modules["torchaudio"] = mod_ta
 sys.modules["torchaudio.transforms"] = mod_tat
 
 # =====================================================================
-# 2. ЗАГРУЗКА И ЭКСПОРТ MERT-V2
+# 2. ЗАГРУЗКА В FP16 C ОГРАНИЧЕНИЕМ ПАМЯТИ
 # =====================================================================
 from transformers import AutoModel
 import litert_torch as litert
 
-print("[1/3] Загрузка модели MERT-v2-FullSong с Hugging Face...")
-raw_mert = AutoModel.from_pretrained("m-a-p/MERT-v2-FullSong", trust_remote_code=True).eval()
+print("[1/3] Загрузка весов MERT-v2-FullSong (FP16, low_cpu_mem_usage)...")
+raw_mert = AutoModel.from_pretrained(
+    "m-a-p/MERT-v2-FullSong",
+    trust_remote_code=True,
+    torch_dtype=torch.float32,     # Для экспорта графа нужен float32
+    low_cpu_mem_usage=True        # Загрузка без дублирования буферов в RAM
+).eval()
 
-print("[2/3] Подготовка трансформерного бэкенда для GPU инференса...")
+print("[2/3] Подготовка трансформера к экспорту...")
+print("Доступные модули в модели:", [name for name, _ in raw_mert.named_children()])
 
-class MERTBackboneOnly(nn.Module):
-    def __init__(self, mert_model):
+class MERTBackboneWrapper(nn.Module):
+    def __init__(self, base_model):
         super().__init__()
-        self.encoder = mert_model.encoder
+        # Если есть вложенный трансформер (encoder/model) — берем его, иначе саму модель
+        if hasattr(base_model, "encoder"):
+            self.backbone = base_model.encoder
+        elif hasattr(base_model, "model"):
+            self.backbone = base_model.model
+        else:
+            self.backbone = base_model
 
-    def forward(self, hidden_features):
-        # hidden_features: [1, seq_len, 1024]
-        encoder_out = self.encoder(hidden_features)
-        last_hidden = encoder_out.last_hidden_state  # [1, seq_len, 1024]
+    def forward(self, hidden_states):
+        # hidden_states: [1, seq_len, 1024]
+        out = self.backbone(hidden_states)
         
-        # Mean pooling и L2-нормализация
-        pooled = torch.mean(last_hidden, dim=1)
+        # Обработка разных типов возвращаемых объектов (tuple или BaseModelOutput)
+        if hasattr(out, "last_hidden_state"):
+            feats = out.last_hidden_state
+        elif isinstance(out, tuple):
+            feats = out[0]
+        else:
+            feats = out
+
+        # Усреднение по временным токенам -> единый вектор трека [1, 1024]
+        pooled = torch.mean(feats, dim=1)
         return F.normalize(pooled, p=2, dim=-1)
 
-backbone = MERTBackboneOnly(raw_mert).eval()
+model_to_export = MERTBackboneWrapper(raw_mert).eval()
 
-# 3 минуты аудио = 180 сек * 25 Hz = 4 500 токенов
+# 3 минуты трека = 180 сек * 25 Hz = 4 500 токенов
 SEQ_LEN = 180 * 25
-sample_features = (torch.zeros(1, SEQ_LEN, 1024, dtype=torch.float32),)
+sample_input = (torch.zeros(1, SEQ_LEN, 1024, dtype=torch.float32),)
 
-print(f"[3/3] Конвертация графа (последовательность {SEQ_LEN} токенов, 1024 dim, FP32) в LiteRT...")
-edge_model = litert.convert(backbone, sample_features)
+print(f"[3/3] Конвертация LiteRT (последовательность {SEQ_LEN} токенов, FP32)...")
+edge_model = litert.convert(model_to_export, sample_input)
 
 output_filename = "mert_v2_backbone.tflite"
 edge_model.export(output_filename)
-print(f"[✓] Успешно экспортировано: {output_filename}")
+print(f"[✓] УСПЕШНО! Модель создана: {output_filename}")
 
