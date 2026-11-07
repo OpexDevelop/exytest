@@ -11,13 +11,12 @@ import kotlin.math.sqrt
 
 class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
 
-    // 10 секунд при частоте 24 000 Гц = 240 000 сэмплов
     private val chunkSize = 240_000
     private val targetSampleRate = 24_000
     private val embeddingDim = 1024
 
     private val compiledModel: CompiledModel = CompiledModel.create(
-        modelFile,
+        modelFile.absolutePath,
         CompiledModel.Options(accelerator)
     )
 
@@ -29,7 +28,6 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
     )
 
     fun processFullTrack(audioFile: File): TrackResult {
-        // 1. Замер декодирования через нативный MediaCodec
         val tDecodeStart = System.currentTimeMillis()
         val pcmFloats = decodeToPcm(audioFile)
         val decodeMs = System.currentTimeMillis() - tDecodeStart
@@ -38,7 +36,6 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
             return TrackResult(FloatArray(embeddingDim), 0, decodeMs, 0L)
         }
 
-        // Если трек короче 10 секунд — дополняем тишиной
         if (pcmFloats.size < chunkSize) {
             val padded = FloatArray(chunkSize)
             System.arraycopy(pcmFloats, 0, padded, 0, pcmFloats.size)
@@ -51,7 +48,6 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
             return TrackResult(singleVector, 1, decodeMs, infMs)
         }
 
-        // 2. Оконная нарезка по 10 секунд с шагом 5 секунд (50% overlap)
         val step = chunkSize / 2
         val accumulatedVector = FloatArray(embeddingDim)
         var chunkCount = 0
@@ -73,14 +69,12 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
             offset += step
         }
 
-        // 3. Time-Average Pooling
         if (chunkCount > 0) {
             for (i in 0 until embeddingDim) {
                 accumulatedVector[i] /= chunkCount.toFloat()
             }
         }
 
-        // 4. L2-нормализация
         normalize(accumulatedVector)
 
         return TrackResult(accumulatedVector, chunkCount, decodeMs, totalInfMs)
@@ -204,3 +198,4 @@ class FullTrackProcessor(modelFile: File, accelerator: Accelerator) {
         compiledModel.close()
     }
 }
+
