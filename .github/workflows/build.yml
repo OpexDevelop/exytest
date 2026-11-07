@@ -1,4 +1,4 @@
-name: Build LiteRT CompiledModel NPU APK
+name: Build LiteRT Embedding Benchmark APK
 
 on:
   push:
@@ -27,30 +27,12 @@ jobs:
       - name: Accept Android SDK Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Generate Float32 Conv Model for NPU
-        run: |
-          mkdir -p app/src/main/assets
-          pip install --quiet tensorflow-cpu
-          python3 -c '
-          import tensorflow as tf
-          inp = tf.keras.Input(shape=(224, 224, 3), dtype=tf.float32)
-          x = tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu")(inp)
-          x = tf.keras.layers.GlobalAveragePooling2D()(x)
-          out = tf.keras.layers.Dense(1001, activation="softmax")(x)
-          model = tf.keras.Model(inputs=inp, outputs=out)
-          converter = tf.lite.TFLiteConverter.from_keras_model(model)
-          tflite_model = converter.convert()
-          with open("app/src/main/assets/model.tflite", "wb") as f:
-              f.write(tflite_model)
-          print("Модель успешно сгенерирована, размер:", len(tflite_model))
-          '
-
       - name: Build Debug APK
         run: gradle :app:assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: litert-probe-apk
+          name: embedding-benchmark-apk
           path: app/build/outputs/apk/debug/*.apk
 
